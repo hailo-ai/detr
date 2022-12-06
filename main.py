@@ -5,8 +5,10 @@ import json
 import random
 import time
 from pathlib import Path
+import logging
 
 import numpy as np
+import os
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -16,6 +18,10 @@ from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build_model
 
+from util.load_model import load_pretrained_weights
+
+from torch.utils.tensorboard import SummaryWriter
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
@@ -23,8 +29,8 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--lr_drop', default=200, type=int)
+    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--lr_drop', default=300, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -55,6 +61,19 @@ def get_args_parser():
     parser.add_argument('--num_queries', default=100, type=int,
                         help="Number of query slots")
     parser.add_argument('--pre_norm', action='store_true')
+    parser.add_argument('--enc_bn', action='store_true')
+    parser.add_argument('--dec_bn', action='store_true')
+    parser.add_argument('--batch_first', action='store_true')
+
+    parser.add_argument('--freeze_backbone', action='store_true')
+    parser.add_argument('--freeze_enc', action='store_true')
+    parser.add_argument('--freeze_dec', action='store_true')
+    parser.add_argument('--freeze_query', action='store_true')
+    parser.add_argument('--freeze_input_proj', action='store_true') # 2048 -> 256 channels in R50->transformer
+    parser.add_argument('--freeze_bbox_embed', action='store_true')
+    parser.add_argument('--freeze_class_embed', action='store_true')
+    parser.add_argument('--freeze_all', action='store_true')
+    parser.add_argument('--mix_precision', action='store_true')
 
     # * Segmentation
     parser.add_argument('--masks', action='store_true',
@@ -63,6 +82,9 @@ def get_args_parser():
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                         help="Disables auxiliary decoding losses (loss at each layer)")
+    parser.add_argument('--no_return_intermediate_dec', dest='return_intermediate_dec', action='store_false',
+                        help="For exporting to onnx this needs to be false")
+                    
     # * Matcher
     parser.add_argument('--set_cost_class', default=1, type=float,
                         help="Class coefficient in the matching cost")
@@ -103,6 +125,7 @@ def get_args_parser():
 
 
 def main(args):
+    
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
@@ -120,6 +143,39 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
+
+    if args.freeze_backbone:
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+
+    if args.freeze_enc:
+        for p in model.transformer.encoder.parameters():
+            p.requires_grad = False
+
+    if args.freeze_dec:
+        for p in model.transformer.decoder.parameters():
+            p.requires_grad = False
+
+    if args.freeze_query:
+        for p in model.query_embed.parameters():
+            p.requires_grad = False
+
+    if args.freeze_input_proj:
+        for p in model.input_proj.parameters():
+            p.requires_grad = False
+
+    if args.freeze_bbox_embed:
+        for p in model.bbox_embed.parameters():
+            p.requires_grad = False
+
+    if args.freeze_class_embed:
+        for p in model.class_embed.parameters():
+            p.requires_grad = False
+
+    if args.freeze_all:
+        for p in model.parameters():
+            p.requires_grad = False
+
 
     model_without_ddp = model
     if args.distributed:
@@ -175,11 +231,35 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        
+        #model_without_ddp.load_state_dict(checkpoint['model'])  # original
+
+        # omer try to match org model with BN model
+        load_pretrained_weights(model_without_ddp, checkpoint)
+
+        '''
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
+        '''
+
+    '''
+    # Sometimes we want to freeze all model and then turn on grads for certain specific layers
+    model_without_ddp.transformer.encoder.layers[5].linear1.bias.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].linear1.weight.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].linear2.bias.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].linear2.weight.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].norm1.bias.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].norm1.weight.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].norm2.bias.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].norm2.weight.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].norm3.bias.requires_grad = True
+    model_without_ddp.transformer.encoder.layers[5].norm3.weight.requires_grad = True
+    '''
+    #model_without_ddp.transformer.encoder.layers[0].norm1.reset_parameters()
+    #model_without_ddp.transformer.encoder.layers[0].norm2.reset_parameters()
+    #model_without_ddp.transformer.encoder.layers[0].norm3.reset_parameters()
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
@@ -188,19 +268,49 @@ def main(args):
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
 
+    # logging
+    if args.output_dir:
+        logging.basicConfig(filename=os.path.join(args.output_dir, 'info.log') , level=logging.INFO)
+        logging.info('  resume: %s', args.resume)
+        logging.info('  lr: %f', args.lr)
+        logging.info('  lr_backbone: %f', args.lr_backbone)
+        logging.info('  batch_size: %d', args.batch_size)
+        logging.info('  weight_decay: %f', args.weight_decay)
+        logging.info('  epochs: %d', args.epochs)
+        logging.info('  lr_drop: %d', args.lr_drop)
+        logging.info('  enc_layers: %d', args.enc_layers)
+        logging.info('  dec_layers: %d', args.dec_layers)
+        logging.info('  dim_feedforward: %d', args.dim_feedforward)
+        logging.info('  hidden_dim: %d', args.hidden_dim)
+        logging.info('  dropout: %f', args.dropout)
+        logging.info('  pre-norm: %s', args.pre_norm)
+        logging.info('  enc_bn: %s', args.enc_bn)
+        logging.info('  dec_bn: %s', args.dec_bn)
+        logging.info('  batch_first: %s', args.batch_first)
+        logging.info('  mix_precision: %s', args.mix_precision)
+        logging.info('  freeze_backbone: %s', args.freeze_backbone)
+        logging.info('  freeze_enc: %s', args.freeze_enc)
+        logging.info('  freeze_dec: %s', args.freeze_dec)
+
+
     print("Start training")
+    best_val_ap = 0  # init val ap tracker
+    writer = SummaryWriter(log_dir=args.output_dir)
+
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
+        
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            args.clip_max_norm, args.mix_precision)
         lr_scheduler.step()
+
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every 100 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
+            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 50 == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
@@ -220,6 +330,25 @@ def main(args):
                      'epoch': epoch,
                      'n_parameters': n_parameters}
 
+        
+        # train & validation stats to tensorboard
+        a=list(coco_evaluator.coco_eval.values())[0]
+        writer.add_scalar('mAP', a.stats[0], epoch)
+        writer.add_scalars("class_error", {'train':train_stats['class_error'], 'test':test_stats['class_error']}, epoch)
+        writer.add_scalars("loss", {'train':train_stats['loss'], 'test':test_stats['loss']}, epoch)
+        writer.add_scalars("loss_ce", {'train':train_stats['loss_ce'], 'test':test_stats['loss_ce']}, epoch)
+        writer.add_scalars("loss_bbox", {'train':train_stats['loss_bbox'], 'test':test_stats['loss_bbox']}, epoch)
+        writer.add_scalars("loss_giou", {'train':train_stats['loss_giou'], 'test':test_stats['loss_giou']}, epoch)
+
+        # save best val AP mode
+        if a.stats[0] > best_val_ap:
+            best_val_ap = a.stats[0]
+            torch.save(model_without_ddp.state_dict(), os.path.join(args.output_dir, 'model_best.pth'))
+
+        if args.output_dir:
+            logging.info('  best val AP: %f', best_val_ap)
+
+
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -238,6 +367,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    writer.flush()
+    writer.close()
 
 
 if __name__ == '__main__':
@@ -245,4 +376,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    
     main(args)

@@ -58,13 +58,13 @@ class DETR(nn.Module):
         """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
-        features, pos = self.backbone(samples)
+        features, pos = self.backbone(samples)  # features=[2, 2048, H/32, W/32], POS=[2, 256, H/32, W/32]
 
-        src, mask = features[-1].decompose()
+        src, mask = features[-1].decompose() # [2, 2048, H/32, W/32]
         assert mask is not None
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]  # [Nheads, batch, query, dim] = [6, 2, 100, 256]
 
-        outputs_class = self.class_embed(hs)
+        outputs_class = self.class_embed(hs)  # [Nheads, batch, query, num_classes + 1] = [6, 2, 100, 92]
         outputs_coord = self.bbox_embed(hs).sigmoid()
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
@@ -267,18 +267,17 @@ class PostProcess(nn.Module):
                           For visualization, this should be the image size after data augment, but before padding
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
-
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 
-        prob = F.softmax(out_logits, -1)
-        scores, labels = prob[..., :-1].max(-1)
+        prob = F.softmax(out_logits, -1)         # soft max along the 92 -> prob=[batch=2, 100, 92]
+        scores, labels = prob[..., :-1].max(-1)  # calc the max & argmax for each of the 100 queries -> scores=[2,100], labels=[2,100]
 
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
         # and from relative [0, 1] to absolute [0, height] coordinates
-        img_h, img_w = target_sizes.unbind(1)
-        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        img_h, img_w = target_sizes.unbind(1)  # img_h = [batch] = array of height of each image in the batch / img_w = ...
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)  # [batch, 4] 
         boxes = boxes * scale_fct[:, None, :]
 
         results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]

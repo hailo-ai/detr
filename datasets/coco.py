@@ -121,6 +121,8 @@ def make_coco_transforms(image_set):
 
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
 
+
+    # org
     if image_set == 'train':
         return T.Compose([
             T.RandomHorizontalFlip(),
@@ -135,12 +137,46 @@ def make_coco_transforms(image_set):
             normalize,
         ])
 
+
+    # org
     if image_set == 'val':
         return T.Compose([
             T.RandomResize([800], max_size=1333),
             normalize,
         ])
 
+    '''
+    # fixed 800x800 wo arp
+    if image_set == 'train':
+        return T.Compose([
+            T.RandomHorizontalFlip(),
+            T.RandomSelect(
+                T.RandomResize([(640,640)]),
+                T.Compose([
+                    T.RandomResize([400, 500, 600]),
+                    T.RandomSizeCrop(384, 600),
+                    T.RandomResize([(800, 800)]),
+                ])
+            ),
+            normalize,
+        ])
+
+    # fixed 800x800 wo arp
+    if image_set == 'val':
+        return T.Compose([
+            T.RandomResize([(800,800)]),
+            normalize,
+        ])
+    '''
+
+    '''
+    # for fixed 640x640 ARP with padding - should be disabled for regular DETR
+    if image_set == 'val':
+        return T.Compose([
+            T.RandomResize([1088], max_size=1088), 
+            normalize,
+        ])
+    '''
     raise ValueError(f'unknown {image_set}')
 
 
